@@ -3,11 +3,17 @@
 static const int kSdClkPin = 39;
 static const int kSdCmdPin = 38;
 static const int kSdData0Pin = 40;
+// If your hardware wires SD D1/D2/D3, define the pins below and use 4-bit mode.
+// static const int kSdData1Pin = -1;
+// static const int kSdData2Pin = -1;
+// static const int kSdData3Pin = -1;
 
 bool initSdCard() {
   SD_MMC.setPins(kSdClkPin, kSdCmdPin, kSdData0Pin);
-  // Lower init frequency to improve stability with some cards/modules.
-  if (!SD_MMC.begin("/sdcard", true, true, SDMMC_FREQ_PROBING, 5)) {
+  // Use 1-bit mode (only D0 wired) but run at high freq for better throughput.
+  // If you wire D1/D2/D3, change the begin() second argument to false (4-bit) and set pins above.
+  const uint32_t freq = SDMMC_FREQ_HIGHSPEED;  // target 40MHz if board/cable/card are OK
+  if (!SD_MMC.begin("/sdcard", true, true, freq, 5)) {
     Serial.println("Card mount failed");
     return false;
   }

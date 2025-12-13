@@ -86,7 +86,10 @@ class HttpViewModel : ViewModel() {
     val state: StateFlow<UiState> = _state
 
     private val client = OkHttpClient.Builder()
-        .callTimeout(15, TimeUnit.SECONDS)
+        .connectTimeout(30, TimeUnit.SECONDS)
+        .readTimeout(30, TimeUnit.SECONDS)
+        .writeTimeout(30, TimeUnit.SECONDS)
+        .callTimeout(30, TimeUnit.SECONDS) // allow slower Wi-Fi/SD reads
         .build()
 
     fun updateBaseUrl(url: String) {
@@ -116,7 +119,7 @@ class HttpViewModel : ViewModel() {
 
     private fun apiUrl(path: String): String = _state.value.baseUrl.trimEnd('/') + path
 
-    fun fetchFrames(page: Int = 1, pageSize: Int = 100) {
+    fun fetchFrames(page: Int = 1, pageSize: Int = 20) {
         viewModelScope.launch(Dispatchers.IO) {
             updateBusy(true)
             try {
