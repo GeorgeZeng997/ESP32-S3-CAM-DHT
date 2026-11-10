@@ -1,20 +1,20 @@
-# ESP32 DHT11 BLE Android App
+# ESP32-S3 CAM Logger Android Client
 
-Minimal Jetpack Compose app that scans for the ESP32 published in this repo, connects over BLE, subscribes to the temperature and humidity characteristics, and shows the live values.
+Jetpack Compose Android application for browsing time-lapse frames recorded by `ESP32-S3-CAM-DHT` over HTTP, previewing captured JPEGs, and encoding any `run_XXXX` capture session into an H.264 `.mp4` video on-device using `MediaCodec` + `MediaMuxer`.
 
-## BLE profile (matches the firmware)
-- Device name: `ESP32-DHT11`
-- Service UUID: `6e400001-b5a3-f393-e0a9-e50e24dcca9e`
-- Characteristics
-  - Temperature (read + notify): `6e400002-b5a3-f393-e0a9-e50e24dcca9e`
-  - Humidity (read + notify): `6e400003-b5a3-f393-e0a9-e50e24dcca9e`
+## Features
 
-## How to build and run
-1. Open the `android-app` folder in Android Studio (AGP 8.5+, JDK 17).
-2. Connect a phone (Android 8+; Android 12+ will prompt for BLE permissions).
-3. Install/run the app. Tap “扫描并连接” to scan, connect, and start receiving values.
+- **Authenticated Frame Browser**: Connects to the ESP32-S3 HTTP server (`http://192.168.4.1` in SoftAP mode or its LAN IP in STA mode) with optional `X-Auth-Token` header authentication.
+- **Live JPEG Preview**: Streams and decodes individual frames from `/frames/file`.
+- **On-Device H.264 MP4 Time-Lapse Export**: Downloads all `.jpg` frames for a selected run, normalizes dimensions to H.264-compliant even resolution, converts frames to `NV21` (`YUV420`), and muxes an `.mp4` clip into the app cache directory.
 
-## Notes
-- The app filters by service UUID *and* device name to reduce false matches.
-- On first use you must grant Bluetooth permissions (and location on Android 11 and below).
-- Press “断开连接” to stop notifications and close the GATT session.
+## Build & Run
+
+1. Open `android-app/` in **Android Studio** (AGP 8.5+, JDK 17) or build from the command line:
+   ```bash
+   cd android-app
+   ./gradlew assembleDebug
+   ```
+2. Connect your phone to the ESP32-S3 SoftAP (`ESP32S3-CAM-SETUP`) or the same Wi-Fi LAN.
+3. Enter the **Device Base URL** and optional **X-Auth-Token**, tap **Save Settings**, and tap **Refresh Frames**.
+4. Tap **Preview** on any frame or **Export Run MP4** to render a time-lapse video.

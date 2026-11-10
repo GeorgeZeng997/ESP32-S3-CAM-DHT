@@ -7,6 +7,7 @@ import android.media.MediaCodec
 import android.media.MediaCodecInfo
 import android.media.MediaFormat
 import android.media.MediaMuxer
+import android.net.Uri
 import android.os.Bundle
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
@@ -89,7 +90,7 @@ class HttpViewModel : ViewModel() {
         .connectTimeout(30, TimeUnit.SECONDS)
         .readTimeout(30, TimeUnit.SECONDS)
         .writeTimeout(30, TimeUnit.SECONDS)
-        .callTimeout(30, TimeUnit.SECONDS) // allow slower Wi-Fi/SD reads
+        .callTimeout(30, TimeUnit.SECONDS)
         .build()
 
     fun updateBaseUrl(url: String) {
@@ -114,10 +115,13 @@ class HttpViewModel : ViewModel() {
             .putString("baseUrl", _state.value.baseUrl)
             .putString("token", _state.value.token)
             .apply()
-        updateStatus("已保存设置")
+        updateStatus("Settings saved")
     }
 
     private fun apiUrl(path: String): String = _state.value.baseUrl.trimEnd('/') + path
+
+    private fun frameFileUrl(run: String, file: String): String =
+        apiUrl("/frames/file?run=${Uri.encode(run)}&file=${Uri.encode(file)}")
 
     fun fetchFrames(page: Int = 1, pageSize: Int = 20) {
         viewModelScope.launch(Dispatchers.IO) {
@@ -143,10 +147,10 @@ class HttpViewModel : ViewModel() {
                             )
                         )
                     }
-                    _state.value = _state.value.copy(frames = list, status = "列表更新成功")
+                    _state.value = _state.value.copy(frames = list, status = "Loaded ${list.size} items")
                 }
             } catch (e: Exception) {
-                updateStatus("拉取列表失败: ${e.message}")
+                updateStatus("Failed to load frame list: ${e.message}")
             } finally {
                 updateBusy(false)
             }
@@ -157,19 +161,19 @@ class HttpViewModel : ViewModel() {
         viewModelScope.launch(Dispatchers.IO) {
             updateBusy(true)
             try {
-                val url = apiUrl("/frames/file?run=${item.run}&file=${item.file}")
                 val req = Request.Builder()
-                    .url(url)
+                    .url(frameFileUrl(item.run, item.file))
                     .addHeader("X-Auth-Token", _state.value.token)
                     .build()
                 client.newCall(req).execute().use { resp ->
                     if (!resp.isSuccessful) throw IllegalStateException("HTTP ${resp.code}")
                     val bytes = resp.body?.bytes() ?: ByteArray(0)
                     val bmp = BitmapFactory.decodeByteArray(bytes, 0, bytes.size)
-                    _state.value = _state.value.copy(preview = bmp, status = "已加载 ${item.file}")
+                        ?: throw IllegalStateException("Unable to decode JPEG")
+                    _state.value = _state.value.copy(preview = bmp, status = "Loaded ${item.file}")
                 }
             } catch (e: Exception) {
-                updateStatus("加载图片失败: ${e.message}")
+                updateStatus("Failed to load image: ${e.message}")
             } finally {
                 updateBusy(false)
             }
@@ -177,9 +181,11 @@ class HttpViewModel : ViewModel() {
     }
 
     fun exportRunToVideo(run: String, context: Context, fps: Int = 10) {
-        val items = _state.value.frames.filter { it.run == run }.sortedBy { it.file }
+        val items = _state.value.frames
+            .filter { it.run == run && it.file.endsWith(".jpg", ignoreCase = true) }
+            .sortedBy { it.file }
         if (items.isEmpty()) {
-            updateStatus("该 run 没有帧")
+            updateStatus("No JPEG frames found for $run")
             return
         }
         viewModelScope.launch(Dispatchers.IO) {
@@ -189,9 +195,9 @@ class HttpViewModel : ViewModel() {
                 val outFile = File(outputDir, "run_${run}_${System.currentTimeMillis()}.mp4")
                 createVideoFromFrames(items, fps, outFile)
                 _state.value = _state.value.copy(videoPath = outFile.absolutePath)
-                updateStatus("视频已生成: ${outFile.absolutePath}")
+                updateStatus("Exported MP4: ${outFile.absolutePath}")
             } catch (e: Exception) {
-                updateStatus("生成视频失败: ${e.message}")
+                updateStatus("Video export failed: ${e.message}")
             } finally {
                 updateBusy(false)
             }
@@ -199,83 +205,91 @@ class HttpViewModel : ViewModel() {
     }
 
     private fun createVideoFromFrames(frames: List<FrameItem>, fps: Int, outFile: File) {
-        // Download first frame to determine size.
         val firstBytes = downloadImageBytes(frames.first())
         val firstBitmap = BitmapFactory.decodeByteArray(firstBytes, 0, firstBytes.size)
-        val width = firstBitmap.width
-        val height = firstBitmap.height
+            ?: throw IllegalStateException("Failed to decode first frame")
+        // H.264 encoders require even frame dimensions.
+        val width = (firstBitmap.width and 1.inv()).coerceAtLeast(16)
+        val height = (firstBitmap.height and 1.inv()).coerceAtLeast(16)
+        firstBitmap.recycle()
 
         val format = MediaFormat.createVideoFormat("video/avc", width, height).apply {
             setInteger(MediaFormat.KEY_COLOR_FORMAT, MediaCodecInfo.CodecCapabilities.COLOR_FormatYUV420Flexible)
-            setInteger(MediaFormat.KEY_BIT_RATE, width * height * 4) // modest bitrate
+            setInteger(MediaFormat.KEY_BIT_RATE, width * height * 4)
             setInteger(MediaFormat.KEY_FRAME_RATE, fps)
             setInteger(MediaFormat.KEY_I_FRAME_INTERVAL, 1)
         }
 
         val codec = MediaCodec.createEncoderByType("video/avc")
-        codec.configure(format, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE)
-        codec.start()
-
         val muxer = MediaMuxer(outFile.absolutePath, MediaMuxer.OutputFormat.MUXER_OUTPUT_MPEG_4)
         var trackIndex = -1
         var muxerStarted = false
-        var framePtsUs = 0L
-        val frameDurationUs = 1_000_000L / fps
 
-        fun drainCodec(endOfStream: Boolean) {
-            if (endOfStream) codec.signalEndOfInputStream()
-            val bufferInfo = MediaCodec.BufferInfo()
-            while (true) {
-                val outputIndex = codec.dequeueOutputBuffer(bufferInfo, 10_000)
-                when {
-                    outputIndex == MediaCodec.INFO_TRY_AGAIN_LATER -> if (!endOfStream) return
-                    outputIndex == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED -> {
-                        if (muxerStarted) throw IllegalStateException("Format changed twice")
-                        trackIndex = muxer.addTrack(codec.outputFormat)
-                        muxer.start()
-                        muxerStarted = true
-                    }
-                    outputIndex >= 0 -> {
-                        val encodedData = codec.getOutputBuffer(outputIndex) ?: throw RuntimeException("null buffer")
-                        if (bufferInfo.size > 0) {
-                          if (!muxerStarted) throw RuntimeException("muxer hasn't started")
-                          encodedData.position(bufferInfo.offset)
-                          encodedData.limit(bufferInfo.offset + bufferInfo.size)
-                          muxer.writeSampleData(trackIndex, encodedData, bufferInfo)
+        try {
+            codec.configure(format, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE)
+            codec.start()
+
+            var framePtsUs = 0L
+            val frameDurationUs = 1_000_000L / fps
+
+            fun drainCodec(endOfStream: Boolean) {
+                val bufferInfo = MediaCodec.BufferInfo()
+                while (true) {
+                    val outputIndex = codec.dequeueOutputBuffer(bufferInfo, 10_000)
+                    when {
+                        outputIndex == MediaCodec.INFO_TRY_AGAIN_LATER -> if (!endOfStream) return
+                        outputIndex == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED -> {
+                            if (muxerStarted) throw IllegalStateException("Format changed twice")
+                            trackIndex = muxer.addTrack(codec.outputFormat)
+                            muxer.start()
+                            muxerStarted = true
                         }
-                        codec.releaseOutputBuffer(outputIndex, false)
-                        if (bufferInfo.flags and MediaCodec.BUFFER_FLAG_END_OF_STREAM != 0) return
+                        outputIndex >= 0 -> {
+                            val encodedData = codec.getOutputBuffer(outputIndex)
+                                ?: throw RuntimeException("Null encoder output buffer")
+                            if (bufferInfo.size > 0) {
+                                if (!muxerStarted) throw RuntimeException("Muxer has not started")
+                                encodedData.position(bufferInfo.offset)
+                                encodedData.limit(bufferInfo.offset + bufferInfo.size)
+                                muxer.writeSampleData(trackIndex, encodedData, bufferInfo)
+                            }
+                            codec.releaseOutputBuffer(outputIndex, false)
+                            if (bufferInfo.flags and MediaCodec.BUFFER_FLAG_END_OF_STREAM != 0) return
+                        }
                     }
                 }
             }
-        }
 
-        // Feed frames.
-        for (frame in frames) {
-            val bytes = downloadImageBytes(frame)
-            val bmp = BitmapFactory.decodeByteArray(bytes, 0, bytes.size)
-            val nv21 = bitmapToNV21(bmp, width, height)
-            val inputIndex = codec.dequeueInputBuffer(10_000)
-            if (inputIndex >= 0) {
-                val inputBuffer: ByteBuffer = codec.getInputBuffer(inputIndex)!!
-                inputBuffer.clear()
-                inputBuffer.put(nv21)
-                codec.queueInputBuffer(
-                    inputIndex,
-                    0,
-                    nv21.size,
-                    framePtsUs,
-                    0
-                )
-                framePtsUs += frameDurationUs
+            for (frame in frames) {
+                val bytes = downloadImageBytes(frame)
+                val bmp = BitmapFactory.decodeByteArray(bytes, 0, bytes.size) ?: continue
+                val nv21 = try {
+                    bitmapToNV21(bmp, width, height)
+                } finally {
+                    bmp.recycle()
+                }
+                val inputIndex = codec.dequeueInputBuffer(10_000)
+                if (inputIndex >= 0) {
+                    val inputBuffer: ByteBuffer = codec.getInputBuffer(inputIndex)!!
+                    inputBuffer.clear()
+                    inputBuffer.put(nv21)
+                    codec.queueInputBuffer(inputIndex, 0, nv21.size, framePtsUs, 0)
+                    framePtsUs += frameDurationUs
+                }
+                drainCodec(false)
             }
-            drainCodec(false)
+
+            val eosIndex = codec.dequeueInputBuffer(10_000)
+            if (eosIndex >= 0) {
+                codec.queueInputBuffer(eosIndex, 0, 0, framePtsUs, MediaCodec.BUFFER_FLAG_END_OF_STREAM)
+                drainCodec(true)
+            }
+        } finally {
+            runCatching { codec.stop() }
+            runCatching { codec.release() }
+            if (muxerStarted) runCatching { muxer.stop() }
+            runCatching { muxer.release() }
         }
-        drainCodec(true)
-        codec.stop()
-        codec.release()
-        if (muxerStarted) muxer.stop()
-        muxer.release()
     }
 
     private fun bitmapToNV21(bitmap: Bitmap, width: Int, height: Int): ByteArray {
@@ -311,9 +325,8 @@ class HttpViewModel : ViewModel() {
     }
 
     private fun downloadImageBytes(frame: FrameItem): ByteArray {
-        val url = apiUrl("/frames/file?run=${frame.run}&file=${frame.file}")
         val req = Request.Builder()
-            .url(url)
+            .url(frameFileUrl(frame.run, frame.file))
             .addHeader("X-Auth-Token", _state.value.token)
             .build()
         client.newCall(req).execute().use { resp ->
@@ -347,35 +360,35 @@ fun MainScreen(
             .padding(16.dp),
         verticalArrangement = Arrangement.spacedBy(12.dp)
     ) {
-        Text("状态: ${state.status}")
+        Text("Status: ${state.status}")
         OutlinedTextField(
             value = state.baseUrl,
             onValueChange = onBaseUrlChange,
-            label = { Text("设备地址 (含协议)") },
+            label = { Text("Device Base URL (e.g. http://192.168.4.1)") },
             modifier = Modifier.fillMaxWidth()
         )
         OutlinedTextField(
             value = state.token,
             onValueChange = onTokenChange,
-            label = { Text("X-Auth-Token") },
+            label = { Text("X-Auth-Token (optional)") },
             modifier = Modifier.fillMaxWidth()
         )
         Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-            Button(onClick = onSave, enabled = !state.isBusy) { Text("保存设置") }
-            Button(onClick = onRefresh, enabled = !state.isBusy) { Text("刷新列表") }
+            Button(onClick = onSave, enabled = !state.isBusy) { Text("Save Settings") }
+            Button(onClick = onRefresh, enabled = !state.isBusy) { Text("Refresh Frames") }
         }
 
         if (state.preview != null) {
             Image(
                 bitmap = state.preview.asImageBitmap(),
-                contentDescription = "preview",
+                contentDescription = "Frame preview",
                 modifier = Modifier
                     .fillMaxWidth()
                     .padding(vertical = 8.dp)
             )
         }
 
-        Text("帧列表(${state.frames.size})")
+        Text("Frames (${state.frames.size})")
         LazyColumn(
             modifier = Modifier
                 .weight(1f)
@@ -386,13 +399,13 @@ fun MainScreen(
                 Column {
                     Text("${item.run} / ${item.file} (${item.size} bytes)")
                     Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                        Button(onClick = { onPreview(item) }, enabled = !state.isBusy) { Text("查看") }
-                        Button(onClick = { onExportRun(item.run) }, enabled = !state.isBusy) { Text("导出该 run") }
+                        Button(onClick = { onPreview(item) }, enabled = !state.isBusy) { Text("Preview") }
+                        Button(onClick = { onExportRun(item.run) }, enabled = !state.isBusy) { Text("Export Run MP4") }
                     }
                 }
             }
         }
 
-        state.videoPath?.let { Text("最近生成视频: $it") }
+        state.videoPath?.let { Text("Last exported video: $it") }
     }
 }

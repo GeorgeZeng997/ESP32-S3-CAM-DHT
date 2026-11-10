@@ -1,42 +1,52 @@
 #include <Arduino.h>
-#include <Preferences.h>
-#include <WiFi.h>
-#include <WebServer.h>
-#include "esp_camera.h"
 #include <FS.h>
+#include <Preferences.h>
 #include <SD_MMC.h>
+#include <WebServer.h>
+#include <WiFi.h>
+#include "esp_camera.h"
 
 #ifndef CAMERA_MODEL_ESP32S3_EYE
 #define CAMERA_MODEL_ESP32S3_EYE  // default; can be overridden via build_flags
 #endif
 #include "camera_pins.h"
+#include "http_security.h"
 #include "sd_utils.h"
 
+#if __has_include("wifi_config.h")
+#include "wifi_config.h"
+#else
+#include "wifi_config.example.h"
+#endif
+
+#ifndef DHT11_PIN
+#define DHT11_PIN 21
+#endif
+
 // ----------------- Configuration constants -----------------
-static const uint32_t kDefaultCycleIntervalMs = 30000;  // capture cadence default
-static const uint64_t kDefaultMinimumFreeSpace = 2ULL * 1024ULL * 1024ULL;  // keep 2MB free
-static const uint32_t kMinCycleMs = 5000;     // 5s lower bound
-static const uint32_t kMaxCycleMs = 600000;   // 10min upper bound
-static const uint32_t kMinFreeMb = 1;         // 1MB lower bound
-static const uint32_t kMaxFreeMb = 512;       // 512MB upper bound
-static const char *kConfigUser = "admin";       // Basic auth for config page
-static const char *kConfigPass = "admin123";
-static const char *kDefaultApSsid = "ESP32CAM-SETUP";
-static const char *kDefaultApPass = "esp32setup";
+static const uint32_t kDefaultCycleIntervalMs = 30000;                        // 30s capture cadence default
+static const uint64_t kDefaultMinimumFreeSpace = 2ULL * 1024ULL * 1024ULL;    // keep 2MB free
+static const uint32_t kMinCycleMs = 5000;                                     // 5s lower bound
+static const uint32_t kMaxCycleMs = 600000;                                   // 10min upper bound
+static const uint32_t kMinFreeMb = 1;                                         // 1MB lower bound
+static const uint32_t kMaxFreeMb = 512;                                       // 512MB upper bound
+static const uint32_t kStaReconnectIntervalMs = 15000;                        // non-blocking STA retry interval
 static const char *kPrefsNs = "cfg";
 
-// DHT11 data pin (set via build flag DHT11_PIN, defaults to GPIO 4).
 constexpr uint8_t kDhtPin = static_cast<uint8_t>(DHT11_PIN);
 
 // ----------------- State -----------------
 static Preferences gPrefs;
 static WebServer gServer(80);
+static portMUX_TYPE gDhtMux = portMUX_INITIALIZER_UNLOCKED;
 
-static String gStaSsid;
-static String gStaPass;
-static String gApSsid = kDefaultApSsid;
-static String gApPass = kDefaultApPass;
-static String gToken = "changeme";
+static String gStaSsid = WIFI_CFG_DEFAULT_STA_SSID;
+static String gStaPass = WIFI_CFG_DEFAULT_STA_PASS;
+static String gApSsid = WIFI_CFG_DEFAULT_AP_SSID;
+static String gApPass = WIFI_CFG_DEFAULT_AP_PASS;
+static String gConfigUser = WIFI_CFG_DEFAULT_CONFIG_USER;
+static String gConfigPass = WIFI_CFG_DEFAULT_CONFIG_PASS;
+static String gToken = WIFI_CFG_DEFAULT_API_TOKEN;
 static bool gApMode = false;
 static uint32_t gCycleIntervalMs = kDefaultCycleIntervalMs;
 static uint64_t gMinimumFreeSpace = kDefaultMinimumFreeSpace;
@@ -47,7 +57,9 @@ static uint32_t gFrameIndex = 0;
 static uint32_t gReadingIndex = 0;
 static uint32_t gRunIndex = 0;
 static bool gCameraReady = false;
+static bool gSdReady = false;
 static bool gSdReadBenchDone = false;
+static uint32_t gLastStaReconnectMs = 0;
 
 // ----------------- Utilities -----------------
 struct SampleSmoother {
@@ -92,29 +104,48 @@ static bool readDht11(int &temperatureC, int &humidity) {
   uint8_t data[5] = {0, 0, 0, 0, 0};
   pinMode(kDhtPin, OUTPUT);
   digitalWrite(kDhtPin, HIGH);
-  delay(250);
+  delay(20);
   digitalWrite(kDhtPin, LOW);
   delay(20);
   digitalWrite(kDhtPin, HIGH);
-  delayMicroseconds(40);
+  delayMicroseconds(35);
   pinMode(kDhtPin, INPUT_PULLUP);
 
-  if (!expectPulse(LOW) || !expectPulse(HIGH)) return false;
+  uint32_t lowCycles[40];
+  uint32_t highCycles[40];
+  bool pulseOk = true;
+
+  portENTER_CRITICAL(&gDhtMux);
+  if (!expectPulse(LOW) || !expectPulse(HIGH)) {
+    pulseOk = false;
+  } else {
+    for (int i = 0; i < 40; ++i) {
+      lowCycles[i] = expectPulse(LOW);
+      highCycles[i] = expectPulse(HIGH);
+      if (lowCycles[i] == 0 || highCycles[i] == 0) {
+        pulseOk = false;
+        break;
+      }
+    }
+  }
+  portEXIT_CRITICAL(&gDhtMux);
+
+  if (!pulseOk) return false;
 
   for (int i = 0; i < 40; ++i) {
-    uint32_t lowCycles = expectPulse(LOW);
-    if (!lowCycles) return false;
-    uint32_t highCycles = expectPulse(HIGH);
-    if (!highCycles) return false;
     data[i / 8] <<= 1;
-    if (highCycles > lowCycles) data[i / 8] |= 1;
+    if (highCycles[i] > lowCycles[i]) data[i / 8] |= 1U;
   }
 
-  uint8_t checksum = (data[0] + data[1] + data[2] + data[3]) & 0xFF;
+  const uint8_t checksum = static_cast<uint8_t>((data[0] + data[1] + data[2] + data[3]) & 0xFFU);
   if (checksum != data[4]) return false;
 
-  humidity = data[0];
-  temperatureC = data[2];
+  const int hum = static_cast<int>(data[0]);
+  const int temp = ((data[3] & 0x80U) != 0U) ? -static_cast<int>(data[2]) : static_cast<int>(data[2]);
+  if (hum < 1 || hum > 100 || temp < -20 || temp > 60) return false;
+
+  humidity = hum;
+  temperatureC = temp;
   return true;
 }
 
@@ -122,7 +153,7 @@ static bool readDht11WithRetry(int &temperatureC, int &humidity) {
   constexpr int kAttempts = 3;
   for (int i = 0; i < kAttempts; ++i) {
     if (readDht11(temperatureC, humidity)) return true;
-    delay(50);
+    delay(60);
   }
   return false;
 }
@@ -189,13 +220,10 @@ static bool initCamera() {
 
 static bool ensureCameraReady() {
   if (gCameraReady) return true;
-  Serial.println("Bringing camera up");
   if (initCamera()) {
     gCameraReady = true;
-    Serial.println("Camera ready");
     return true;
   }
-  Serial.println("Camera init failed");
   return false;
 }
 
@@ -224,7 +252,7 @@ static void setCameraSoftPd(bool enable) {
   int reg = s->get_reg(s, 0x3008, 0xFF);
   if (reg < 0) return;
   if (enable) {
-    reg |= 0x40;  // Bit6 = software power down.
+    reg |= 0x40;
   } else {
     reg &= ~0x40;
   }
@@ -232,6 +260,7 @@ static void setCameraSoftPd(bool enable) {
 }
 
 static void powerDownCamera() {
+  if (!gCameraReady) return;
   setCameraSoftPd(true);
   esp_camera_deinit();
   gCameraReady = false;
@@ -264,6 +293,59 @@ static void benchmarkSdRead(const char *path) {
   gSdReadBenchDone = true;
 }
 
+static void captureFrameOnce(bool runBenchmark) {
+  uint64_t freeBytes = sdFreeBytes();
+  if (freeBytes < gMinimumFreeSpace) {
+    Serial.println("Not enough free space on TF card; skipping capture");
+    return;
+  }
+  if (!ensureCameraReady()) {
+    Serial.println("Camera init failed; skipping capture");
+    return;
+  }
+  camera_fb_t *fb = esp_camera_fb_get();
+  if (fb) {
+    freeBytes = sdFreeBytes();
+    if (freeBytes >= fb->len + gMinimumFreeSpace) {
+      String savedPath;
+      if (saveJpegFrame(sessionDir.c_str(), gFrameIndex++, fb->buf, fb->len, savedPath)) {
+        gLastFramePath = savedPath;
+        Serial.printf("Saved %s (%u bytes)\n", savedPath.c_str(), static_cast<unsigned>(fb->len));
+        if (runBenchmark) {
+          benchmarkSdRead(gLastFramePath.c_str());
+        }
+      } else {
+        Serial.println("Failed to write frame");
+      }
+    } else {
+      Serial.println("Not enough space for this frame");
+    }
+    esp_camera_fb_return(fb);
+  } else {
+    Serial.println("Camera capture failed");
+  }
+  powerDownCamera();
+}
+
+static void recordDhtReadingOnce() {
+  int temperatureC = 0;
+  int humidity = 0;
+  if (readDht11WithRetry(temperatureC, humidity)) {
+    gSmoother.add(temperatureC, humidity);
+    const int smoothTemp = gSmoother.avgTemp();
+    const int smoothHum = gSmoother.avgHum();
+    if (appendReading(smoothTemp, smoothHum)) {
+      Serial.printf("Logged T=%dC H=%d%% (raw %d/%d)\n",
+                    smoothTemp, smoothHum, temperatureC, humidity);
+      ++gReadingIndex;
+    } else {
+      Serial.println("Failed to append reading");
+    }
+  } else {
+    Serial.println("DHT11 read failed");
+  }
+}
+
 // ----------------- Wi-Fi + HTTP -----------------
 
 static String jsonEscape(const String &in) {
@@ -275,21 +357,76 @@ static String jsonEscape(const String &in) {
       case '\"': out += "\\\""; break;
       case '\\': out += "\\\\"; break;
       case '\n': out += "\\n"; break;
+      case '\r': out += "\\r"; break;
       default: out += c; break;
     }
   }
   return out;
 }
 
+static String htmlEscapeString(const String &in) {
+  char buf[192];
+  camsec::htmlEscapeToBuf(in.c_str(), buf, sizeof(buf));
+  return String(buf);
+}
+
 static bool requireAuth() {
-  // Auth disabled: allow all requests.
-  return true;
+  // Enforce API token verification whenever gToken is configured (via X-Auth-Token header or ?token=).
+  if (gToken.isEmpty()) {
+    return true;
+  }
+  String candidate = gServer.header("X-Auth-Token");
+  if (candidate.isEmpty() && gServer.hasArg("token")) {
+    candidate = gServer.arg("token");
+  }
+  if (camsec::constantTimeEquals(candidate.c_str(), gToken.c_str())) {
+    return true;
+  }
+  gServer.send(401, "application/json", "{\"error\":\"unauthorized\"}");
+  return false;
+}
+
+static bool checkConfigAuth() {
+  // Enforce HTTP Basic Auth on /config whenever a config password is set.
+  if (gConfigPass.isEmpty()) {
+    return true;
+  }
+  if (gServer.authenticate(gConfigUser.c_str(), gConfigPass.c_str())) {
+    return true;
+  }
+  gServer.requestAuthentication();
+  return false;
+}
+
+static void handleApiStatus() {
+  if (!requireAuth()) return;
+  const IPAddress ip = gApMode ? WiFi.softAPIP() : WiFi.localIP();
+  const uint64_t freeMb = gSdReady ? (sdFreeBytes() / (1024ULL * 1024ULL)) : 0ULL;
+  char payload[384];
+  snprintf(payload, sizeof(payload),
+           "{\"run\":%lu,\"frames\":%lu,\"readings\":%lu,"
+           "\"temp_c\":%d,\"hum_pct\":%d,\"sd_free_mb\":%llu,"
+           "\"wifi_mode\":\"%s\",\"ip\":\"%s\",\"sta_connected\":%s,"
+           "\"cycle_ms\":%lu,\"free_heap\":%lu,\"uptime_ms\":%lu}",
+           static_cast<unsigned long>(gRunIndex),
+           static_cast<unsigned long>(gFrameIndex),
+           static_cast<unsigned long>(gReadingIndex),
+           gSmoother.avgTemp(),
+           gSmoother.avgHum(),
+           static_cast<unsigned long long>(freeMb),
+           gApMode ? "ap" : "sta",
+           ip.toString().c_str(),
+           (WiFi.status() == WL_CONNECTED) ? "true" : "false",
+           static_cast<unsigned long>(gCycleIntervalMs),
+           static_cast<unsigned long>(ESP.getFreeHeap()),
+           static_cast<unsigned long>(millis()));
+  gServer.send(200, "application/json", payload);
 }
 
 static void handleListFrames() {
   if (!requireAuth()) return;
-  const int page = gServer.hasArg("page") ? gServer.arg("page").toInt() : 1;
-  const int pageSize = gServer.hasArg("page_size") ? gServer.arg("page_size").toInt() : 50;
+  const int page = camsec::clampPage(gServer.hasArg("page") ? gServer.arg("page").toInt() : 1);
+  const int pageSize = camsec::clampPageSize(gServer.hasArg("page_size") ? gServer.arg("page_size").toInt() : 50);
   unsigned long t0 = millis();
   const int startIndex = (page - 1) * pageSize;
   int sent = 0;
@@ -306,17 +443,20 @@ static void handleListFrames() {
   File runDir = root.openNextFile();
   while (runDir) {
     if (runDir.isDirectory()) {
-      String runName = runDir.name();  // e.g. /data/run_0001
+      String runName = runDir.name();
+      String runLeaf = runName.substring(runName.lastIndexOf('/') + 1);
       File f = runDir.openNextFile();
       while (f) {
         if (!f.isDirectory()) {
+          String fName = f.name();
+          String fileLeaf = fName.substring(fName.lastIndexOf('/') + 1);
           if (skipped < startIndex) {
             ++skipped;
           } else if (sent < pageSize) {
             if (!first) payload += ",";
-            payload += "{\"run\":\"" + jsonEscape(runName.substring(runName.lastIndexOf('/') + 1)) + "\",";
-            payload += "\"file\":\"" + jsonEscape(f.name()) + "\",";
-            payload += "\"size\":" + String((unsigned long)f.size()) + "}";
+            payload += "{\"run\":\"" + jsonEscape(runLeaf) + "\",";
+            payload += "\"file\":\"" + jsonEscape(fileLeaf) + "\",";
+            payload += "\"size\":" + String(static_cast<unsigned long>(f.size())) + "}";
             first = false;
             ++sent;
           }
@@ -326,11 +466,10 @@ static void handleListFrames() {
         f = runDir.openNextFile();
       }
     }
-    if (sent >= pageSize) break;
     runDir.close();
+    if (sent >= pageSize) break;
     runDir = root.openNextFile();
   }
-  if (runDir) runDir.close();
   root.close();
 
   payload += "],\"has_more\":";
@@ -346,17 +485,13 @@ static void handleLatest() {
   unsigned long t0 = millis();
   if (gLastFramePath.isEmpty()) {
     gServer.send(404, "application/json", "{\"error\":\"no frames yet\"}");
-    Serial.printf("HTTP /frames/latest -> 404 (no frame) in %lums\n", millis() - t0);
     return;
   }
   File f = SD_MMC.open(gLastFramePath.c_str(), FILE_READ);
   if (!f) {
     gServer.send(404, "application/json", "{\"error\":\"missing file\"}");
-    Serial.printf("HTTP /frames/latest -> 404 (missing file) in %lums\n", millis() - t0);
     return;
   }
-  Serial.printf("HTTP /frames/latest streaming %s (%u bytes)\n",
-                gLastFramePath.c_str(), static_cast<unsigned>(f.size()));
   gServer.streamFile(f, "image/jpeg");
   f.close();
   Serial.printf("HTTP /frames/latest done in %lums\n", millis() - t0);
@@ -367,49 +502,50 @@ static void handleFetchFrame() {
   unsigned long t0 = millis();
   if (!gServer.hasArg("run") || !gServer.hasArg("file")) {
     gServer.send(400, "application/json", "{\"error\":\"missing run or file\"}");
-    Serial.printf("HTTP /frames/file -> 400 (missing args) in %lums\n", millis() - t0);
     return;
   }
-  String path = "/data/";
-  path += gServer.arg("run");
-  path += "/";
-  path += gServer.arg("file");
-  File f = SD_MMC.open(path.c_str(), FILE_READ);
-  if (!f) {
-    gServer.send(404, "application/json", "{\"error\":\"not found\"}");
-    Serial.printf("HTTP /frames/file %s -> 404 in %lums\n", path.c_str(), millis() - t0);
+  const String runArg = gServer.arg("run");
+  const String fileArg = gServer.arg("file");
+  if (!camsec::isValidSafeSegment(runArg.c_str()) || !camsec::isValidSafeSegment(fileArg.c_str())) {
+    gServer.send(400, "application/json", "{\"error\":\"invalid run or file name\"}");
     return;
   }
-  Serial.printf("HTTP /frames/file %s (%u bytes)\n",
-                path.c_str(), static_cast<unsigned>(f.size()));
-  gServer.streamFile(f, "image/jpeg");
-  f.close();
-  Serial.printf("HTTP /frames/file done in %lums\n", millis() - t0);
-}
 
-static bool checkConfigAuth() {
-  // Auth disabled: allow config page without Basic auth.
-  return true;
+  String path = "/data/" + runArg + "/" + fileArg;
+  File f = SD_MMC.open(path.c_str(), FILE_READ);
+  if (!f || f.isDirectory()) {
+    if (f) f.close();
+    gServer.send(404, "application/json", "{\"error\":\"not found\"}");
+    return;
+  }
+  gServer.streamFile(f, camsec::contentTypeForFilename(fileArg.c_str()));
+  f.close();
+  Serial.printf("HTTP /frames/file %s done in %lums\n", path.c_str(), millis() - t0);
 }
 
 static void handleConfigForm() {
   if (!checkConfigAuth()) return;
-  String html = "<html><body><h3>ESP32-S3-CAM-DHT Setup</h3>"
-                "<form method='POST' action='/config'>"
-                "Mode: <select name='mode'>"
-                "<option value='sta'" + String(gApMode ? "" : " selected") + ">STA</option>"
-                "<option value='ap'" + String(gApMode ? " selected" : "") + ">AP</option>"
+  // Never echo saved passwords or API tokens back into HTML source.
+  String html = "<!DOCTYPE html><html lang=\"en\"><head><meta charset=\"UTF-8\">"
+                "<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">"
+                "<title>ESP32-S3-CAM-DHT Setup</title></head><body>"
+                "<h3>ESP32-S3-CAM-DHT Configuration</h3>"
+                "<form method=\"POST\" action=\"/config\" autocomplete=\"off\">"
+                "Mode: <select name=\"mode\">"
+                "<option value=\"sta\"" + String(gApMode ? "" : " selected") + ">STA</option>"
+                "<option value=\"ap\"" + String(gApMode ? " selected" : "") + ">AP</option>"
                 "</select><br/>"
-                "STA SSID: <input name='ssid' value='" + gStaSsid + "'/><br/>"
-                "STA Password: <input type='password' name='pass' value='" + gStaPass + "'/><br/>"
-                "AP SSID: <input name='ap_ssid' value='" + gApSsid + "'/><br/>"
-                "AP Password: <input type='password' name='ap_pass' value='" + gApPass + "'/><br/>"
-                "Cycle (ms): <input name='cycle_ms' value='" + String(gCycleIntervalMs) + "'/><br/>"
-                "Min free (MB): <input name='min_free_mb' value='" + String((unsigned long)(gMinimumFreeSpace / (1024 * 1024))) + "'/><br/>"
-                "Token: <input type='password' name='token' value='" + gToken + "'/><br/>"
-                "<input type='submit' value='Save'/>"
+                "STA SSID: <input name=\"ssid\" maxlength=\"32\" value=\"" + htmlEscapeString(gStaSsid) + "\"/><br/>"
+                "STA Password: <input type=\"password\" name=\"pass\" maxlength=\"64\" value=\"\" placeholder=\"(unchanged if blank)\"/><br/>"
+                "AP SSID: <input name=\"ap_ssid\" maxlength=\"32\" value=\"" + htmlEscapeString(gApSsid) + "\"/><br/>"
+                "AP Password: <input type=\"password\" name=\"ap_pass\" maxlength=\"64\" value=\"\" placeholder=\"(unchanged if blank; >=8 chars for WPA2)\"/><br/>"
+                "Cycle (ms): <input name=\"cycle_ms\" value=\"" + String(gCycleIntervalMs) + "\"/><br/>"
+                "Min free (MB): <input name=\"min_free_mb\" value=\"" + String(static_cast<unsigned long>(gMinimumFreeSpace / (1024ULL * 1024ULL))) + "\"/><br/>"
+                "API Token: <input type=\"password\" name=\"token\" maxlength=\"64\" value=\"\" placeholder=\"(unchanged if blank)\"/><br/>"
+                "Admin Password (/config): <input type=\"password\" name=\"cfg_pass\" maxlength=\"64\" value=\"\" placeholder=\"(unchanged if blank)\"/><br/>"
+                "<input type=\"submit\" value=\"Save\"/>"
                 "</form></body></html>";
-  gServer.send(200, "text/html", html);
+  gServer.send(200, "text/html; charset=utf-8", html);
 }
 
 static uint32_t sanitizeCycleMs(uint32_t v) {
@@ -424,18 +560,29 @@ static uint64_t sanitizeMinFreeBytes(uint32_t mb) {
 
 static void handleConfigPost() {
   if (!checkConfigAuth()) return;
-  String mode = gServer.arg("mode");
-  gApMode = (mode == "ap");
-  gStaSsid = gServer.arg("ssid");
-  gStaPass = gServer.arg("pass");
-  gApSsid = gServer.arg("ap_ssid");
-  gApPass = gServer.arg("ap_pass");
-  gToken = gServer.arg("token");
+  gApMode = (gServer.arg("mode") == "ap");
+  if (gServer.hasArg("ssid")) {
+    gStaSsid = gServer.arg("ssid");
+  }
+  if (gServer.hasArg("ap_ssid") && !gServer.arg("ap_ssid").isEmpty()) {
+    gApSsid = gServer.arg("ap_ssid");
+  }
+  // Preserve existing secrets when password fields are left blank on the form.
+  if (gServer.hasArg("pass") && !gServer.arg("pass").isEmpty()) {
+    gStaPass = gServer.arg("pass");
+  }
+  if (gServer.hasArg("ap_pass") && !gServer.arg("ap_pass").isEmpty()) {
+    gApPass = gServer.arg("ap_pass");
+  }
+  if (gServer.hasArg("token") && !gServer.arg("token").isEmpty()) {
+    gToken = gServer.arg("token");
+  }
+  if (gServer.hasArg("cfg_pass") && !gServer.arg("cfg_pass").isEmpty()) {
+    gConfigPass = gServer.arg("cfg_pass");
+  }
 
-  uint32_t newCycle = sanitizeCycleMs(gServer.arg("cycle_ms").toInt());
-  uint64_t newMinFree = sanitizeMinFreeBytes(gServer.arg("min_free_mb").toInt());
-  gCycleIntervalMs = newCycle;
-  gMinimumFreeSpace = newMinFree;
+  gCycleIntervalMs = sanitizeCycleMs(static_cast<uint32_t>(gServer.arg("cycle_ms").toInt()));
+  gMinimumFreeSpace = sanitizeMinFreeBytes(static_cast<uint32_t>(gServer.arg("min_free_mb").toInt()));
 
   gPrefs.begin(kPrefsNs, false);
   gPrefs.putString("mode", gApMode ? "ap" : "sta");
@@ -444,37 +591,37 @@ static void handleConfigPost() {
   gPrefs.putString("ap_ssid", gApSsid);
   gPrefs.putString("ap_pass", gApPass);
   gPrefs.putString("token", gToken);
+  gPrefs.putString("cfg_pass", gConfigPass);
   gPrefs.putULong("cycle_ms", gCycleIntervalMs);
-  gPrefs.putULong("min_free_mb", static_cast<uint32_t>(gMinimumFreeSpace / (1024 * 1024)));
+  gPrefs.putULong("min_free_mb", static_cast<uint32_t>(gMinimumFreeSpace / (1024ULL * 1024ULL)));
   gPrefs.end();
 
-  gServer.send(200, "text/plain", "Saved. Reboot device.");
+  gServer.send(200, "text/plain; charset=utf-8", "Configuration saved. Reboot the device to apply Wi-Fi mode changes.");
 }
 
 static void handleBrowse() {
-  // Simple HTML browser for manual download without token.
-  String html = "<html><body><h3>Files</h3><ul>";
+  if (!requireAuth()) return;
   File root = SD_MMC.open("/data");
   if (!root) {
-    gServer.send(500, "text/plain", "SD not ready");
+    gServer.send(500, "text/plain; charset=utf-8", "SD card not ready");
     return;
   }
+  String html = "<!DOCTYPE html><html lang=\"en\"><head><meta charset=\"UTF-8\"><title>Recorded Runs</title></head><body><h3>Recorded Files</h3><ul>";
   File runDir = root.openNextFile();
   while (runDir) {
     if (runDir.isDirectory()) {
       String runName = runDir.name();
-      html += "<li>" + runName + "<ul>";
+      String runLeaf = runName.substring(runName.lastIndexOf('/') + 1);
+      html += "<li>" + htmlEscapeString(runLeaf) + "<ul>";
       File f = runDir.openNextFile();
       while (f) {
         if (!f.isDirectory()) {
-          String fileName = f.name();
-          html += "<li><a href=\"/frames/file?run=";
-          html += runName.substring(runName.lastIndexOf('/') + 1);
-          html += "&file=";
-          html += fileName;
-          html += "\">";
-          html += fileName;
-          html += "</a> (" + String((unsigned long)f.size()) + " bytes)</li>";
+          String fName = f.name();
+          String fileLeaf = fName.substring(fName.lastIndexOf('/') + 1);
+          html += "<li><a href=\"/frames/file?run=" + htmlEscapeString(runLeaf) +
+                  "&file=" + htmlEscapeString(fileLeaf) + "\">" +
+                  htmlEscapeString(fileLeaf) + "</a> (" +
+                  String(static_cast<unsigned long>(f.size())) + " bytes)</li>";
         }
         f.close();
         f = runDir.openNextFile();
@@ -486,10 +633,14 @@ static void handleBrowse() {
   }
   root.close();
   html += "</ul></body></html>";
-  gServer.send(200, "text/html", html);
+  gServer.send(200, "text/html; charset=utf-8", html);
 }
 
 static void registerHttpHandlers() {
+  static const char *kCollectedHeaders[] = {"X-Auth-Token"};
+  gServer.collectHeaders(kCollectedHeaders, 1);
+
+  gServer.on("/api/status", HTTP_GET, handleApiStatus);
   gServer.on("/frames", HTTP_GET, handleListFrames);
   gServer.on("/frames/latest", HTTP_GET, handleLatest);
   gServer.on("/frames/file", HTTP_GET, handleFetchFrame);
@@ -503,13 +654,15 @@ static void registerHttpHandlers() {
 static void loadPrefs() {
   gPrefs.begin(kPrefsNs, true);
   gApMode = gPrefs.getString("mode", "sta") == "ap";
-  gStaSsid = gPrefs.getString("ssid", "");
-  gStaPass = gPrefs.getString("pass", "");
-  gApSsid = gPrefs.getString("ap_ssid", kDefaultApSsid);
-  gApPass = gPrefs.getString("ap_pass", kDefaultApPass);
-  gToken = gPrefs.getString("token", "changeme");
-  uint32_t storedCycle = gPrefs.getULong("cycle_ms", kDefaultCycleIntervalMs);
-  uint32_t storedMinFreeMb = gPrefs.getULong("min_free_mb", static_cast<uint32_t>(kDefaultMinimumFreeSpace / (1024 * 1024)));
+  gStaSsid = gPrefs.getString("ssid", WIFI_CFG_DEFAULT_STA_SSID);
+  gStaPass = gPrefs.getString("pass", WIFI_CFG_DEFAULT_STA_PASS);
+  gApSsid = gPrefs.getString("ap_ssid", WIFI_CFG_DEFAULT_AP_SSID);
+  gApPass = gPrefs.getString("ap_pass", WIFI_CFG_DEFAULT_AP_PASS);
+  gToken = gPrefs.getString("token", WIFI_CFG_DEFAULT_API_TOKEN);
+  gConfigPass = gPrefs.getString("cfg_pass", WIFI_CFG_DEFAULT_CONFIG_PASS);
+  const uint32_t storedCycle = gPrefs.getULong("cycle_ms", kDefaultCycleIntervalMs);
+  const uint32_t storedMinFreeMb = gPrefs.getULong(
+      "min_free_mb", static_cast<uint32_t>(kDefaultMinimumFreeSpace / (1024ULL * 1024ULL)));
   gPrefs.end();
   gCycleIntervalMs = sanitizeCycleMs(storedCycle);
   gMinimumFreeSpace = sanitizeMinFreeBytes(storedMinFreeMb);
@@ -518,16 +671,19 @@ static void loadPrefs() {
 static void startApConfigPortal() {
   gApMode = true;
   WiFi.mode(WIFI_AP);
-  WiFi.softAP(gApSsid.c_str(), gApPass.c_str());
-  Serial.printf("AP mode. SSID: %s, IP: %s\n", gApSsid.c_str(), WiFi.softAPIP().toString().c_str());
+  const char *pass = (gApPass.length() >= 8) ? gApPass.c_str() : nullptr;
+  WiFi.softAP(gApSsid.c_str(), pass);
+  Serial.printf("AP mode active. SSID: %s, IP: %s\n",
+                gApSsid.c_str(), WiFi.softAPIP().toString().c_str());
   registerHttpHandlers();
 }
 
 static bool connectStaWithTimeout(uint32_t timeoutMs) {
   WiFi.mode(WIFI_STA);
+  WiFi.setAutoReconnect(true);
   WiFi.begin(gStaSsid.c_str(), gStaPass.c_str());
-  Serial.printf("Connecting to %s\n", gStaSsid.c_str());
-  uint32_t start = millis();
+  Serial.printf("Connecting to STA SSID \"%s\"\n", gStaSsid.c_str());
+  const uint32_t start = millis();
   while (WiFi.status() != WL_CONNECTED && millis() - start < timeoutMs) {
     delay(200);
     Serial.print(".");
@@ -541,31 +697,45 @@ static bool connectStaWithTimeout(uint32_t timeoutMs) {
   return false;
 }
 
+static void maintainWifiConnection(uint32_t nowMs) {
+  if (gApMode || gStaSsid.isEmpty() || WiFi.status() == WL_CONNECTED) {
+    return;
+  }
+  if (nowMs - gLastStaReconnectMs >= kStaReconnectIntervalMs) {
+    gLastStaReconnectMs = nowMs;
+    Serial.println("[WIFI] STA disconnected; triggering non-blocking reconnect...");
+    WiFi.disconnect();
+    WiFi.begin(gStaSsid.c_str(), gStaPass.c_str());
+  }
+}
+
 // ----------------- Setup & loop -----------------
 
 void setup() {
   Serial.begin(115200);
   delay(200);
-  Serial.println("\nESP32-S3 CAM + DHT11 logger with HTTP file access");
+  Serial.println("\nESP32-S3 CAM + DHT11 logger with HTTP API");
   loadPrefs();
 
   if (!initSdCard()) {
-    Serial.println("SD init failed; halt");
+    Serial.println("SD init failed; starting AP config portal without SD logging");
+    startApConfigPortal();
     return;
   }
+  gSdReady = true;
+
   if (!ensureDir("/data")) {
     Serial.println("Failed to create /data; halt");
     return;
   }
 
-  // Determine next run directory by scanning existing run_* folders.
   File root = SD_MMC.open("/data");
   uint32_t maxRun = 0;
   if (root) {
     File d = root.openNextFile();
     while (d) {
       if (d.isDirectory()) {
-        String name = d.name();  // e.g. /data/run_0005
+        String name = d.name();
         int idx = name.lastIndexOf('_');
         if (idx >= 0) {
           String numStr = name.substring(idx + 1);
@@ -588,94 +758,28 @@ void setup() {
   sessionDir = dirBuf;
   Serial.printf("Session dir: %s\n", sessionDir.c_str());
 
-  if (!ensureCameraReady()) {
-    Serial.println("Camera init failed; halt");
-    return;
-  }
-
   if (!gApMode && !gStaSsid.isEmpty() && connectStaWithTimeout(15000)) {
     Serial.println("Using STA mode");
     registerHttpHandlers();
   } else {
-    Serial.println("Falling back to AP config");
+    Serial.println("Falling back to AP config portal");
     startApConfigPortal();
   }
 
-  // First capture immediately.
-  camera_fb_t *fb = esp_camera_fb_get();
-  if (fb) {
-    uint64_t freeBytes = sdFreeBytes();
-    if (freeBytes >= fb->len + gMinimumFreeSpace) {
-      String savedPath;
-      if (saveJpegFrame(sessionDir.c_str(), gFrameIndex++, fb->buf, fb->len, savedPath)) {
-        gLastFramePath = savedPath;
-        Serial.printf("Saved %s (%u bytes)\n", savedPath.c_str(), static_cast<unsigned>(fb->len));
-        benchmarkSdRead(gLastFramePath.c_str());
-      } else {
-        Serial.println("Failed to write frame");
-      }
-    } else {
-      Serial.println("Not enough space for initial frame");
-    }
-    esp_camera_fb_return(fb);
-  }
-  powerDownCamera();
+  captureFrameOnce(true);
+  recordDhtReadingOnce();
 }
 
 void loop() {
   static uint32_t lastCycleMs = 0;
   const uint32_t now = millis();
 
-  if (now - lastCycleMs >= gCycleIntervalMs) {
+  maintainWifiConnection(now);
+
+  if (gSdReady && (now - lastCycleMs >= gCycleIntervalMs)) {
     lastCycleMs = now;
-
-    uint64_t freeBytes = sdFreeBytes();
-    if (freeBytes < gMinimumFreeSpace) {
-      Serial.println("Not enough free space on TF card; skipping capture");
-    } else {
-      if (!ensureCameraReady()) {
-        Serial.println("Camera init failed; skipping capture");
-        goto readings;
-      }
-      camera_fb_t *fb = esp_camera_fb_get();
-      if (fb) {
-        freeBytes = sdFreeBytes();
-        if (freeBytes >= fb->len + gMinimumFreeSpace) {
-          String savedPath;
-          if (saveJpegFrame(sessionDir.c_str(), gFrameIndex++, fb->buf, fb->len, savedPath)) {
-            gLastFramePath = savedPath;
-            Serial.printf("Saved %s (%u bytes)\n", savedPath.c_str(), static_cast<unsigned>(fb->len));
-          } else {
-            Serial.println("Failed to write frame");
-          }
-        } else {
-          Serial.println("Not enough space for this frame");
-        }
-        esp_camera_fb_return(fb);
-      } else {
-        Serial.println("Camera capture failed");
-      }
-    }
-    powerDownCamera();
-
-readings:
-    int temperatureC = 0;
-    int humidity = 0;
-    if (readDht11WithRetry(temperatureC, humidity)) {
-      gSmoother.add(temperatureC, humidity);
-      int smoothTemp = gSmoother.avgTemp();
-      int smoothHum = gSmoother.avgHum();
-      if (appendReading(smoothTemp, smoothHum)) {
-        Serial.printf("Logged T=%dC H=%d%% (raw %d/%d)\n",
-                      smoothTemp, smoothHum, temperatureC, humidity);
-        ++gReadingIndex;
-      } else {
-        Serial.println("Failed to append reading");
-      }
-    } else {
-      Serial.println("DHT11 read failed");
-    }
-
+    captureFrameOnce(false);
+    recordDhtReadingOnce();
   }
 
   gServer.handleClient();
