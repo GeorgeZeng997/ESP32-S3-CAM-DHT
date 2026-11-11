@@ -1,9 +1,29 @@
-.pio
+# PlatformIO & IDEs
+.pio/
 .vscode/
-.vscode/.browse.c_cpp.db*
-.vscode/c_cpp_properties.json
-.vscode/launch.json
-.vscode/ipch
-android-app/.gradle/
-android-app/build/
-android-app/local.properties
+.idea/
+compile_commands.json
+
+# Local device credentials (copy from include/wifi_config.example.h)
+include/wifi_config.h
+
+# Android / Gradle
+.gradle/
+**/.gradle/
+**/build/
+**/.cxx/
+**/*.iml
+local.properties
+**/local.properties
+*.keystore
+*.jks
+
+# Host test outputs
+*.exe
+*.out
+__pycache__/
+.pytest_cache/
+
+# OS cruft
+.DS_Store
+Thumbs.db

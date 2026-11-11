@@ -1,0 +1,37 @@
+name: CI
+
+on:
+  push:
+    branches: [ main, master, "chore/**" ]
+  pull_request:
+
+jobs:
+  security-and-firmware:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Run C++17 HTTP security unit tests
+        run: |
+          g++ -std=c++17 -Wall -Wextra -Werror tests/test_http_security.cpp -o /tmp/test_http_security
+          /tmp/test_http_security
+
+      - name: Run Python security invariant tests
+        run: python3 -m unittest discover -s tests -v
+
+      - name: Set up Python for PlatformIO
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Cache PlatformIO
+        uses: actions/cache@v4
+        with:
+          path: ~/.platformio
+          key: ${{ runner.os }}-pio-esp32s3-cam-dht-${{ hashFiles('platformio.ini') }}
+
+      - name: Build ESP32-S3-CAM firmware
+        run: |
+          pip install --upgrade platformio
+          pio run
